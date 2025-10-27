@@ -1,8 +1,8 @@
-# LoopToVecs
+# LoopToVecs.jl
 
 [![Build Status](https://github.com/NoFixedPoint/LoopToVecs.jl/actions/workflows/CI.yml/badge.svg?branch=master)](https://github.com/NoFixedPoint/LoopToVecs.jl/actions/workflows/CI.yml?query=branch%3Amaster)
 
-LoopToVecs is a lightweight package that converts loop-based computations in einsum notation into vectorized code. It exports a single macro, `@t`. For usage examples, see below and in the `test/` directory.
+LoopToVecs.jl is a lightweight package that converts loop-based computations in einsum notation into vectorized code. It exports a single macro, `@t`. For usage examples, see below and in the `test/` directory.
 
 ```julia
 using LoopToVecs
