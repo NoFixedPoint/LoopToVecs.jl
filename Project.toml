@@ -1,13 +1,16 @@
 name = "LoopToVecs"
 uuid = "6a3a6ab9-d92e-4ecd-8bd0-f0d9833b6572"
-authors = ["Wenlan Luo <luowenlan@gmail.com> and contributors"]
-version = "1.0.0-DEV"
+authors = ["Wenlan Luo <luowenlan@gmail.com>"]
+version = "1.0.0"
+
+[deps]
 
 [compat]
 julia = "1.6.7"
 
 [extras]
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+Random = "9a3f8284-a2c9-5f02-9a11-845980a1fd5c"
 
 [targets]
-test = ["Test"]
+test = ["Test", "Random"]

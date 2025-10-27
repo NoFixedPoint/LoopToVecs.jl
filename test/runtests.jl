@@ -1,6 +1,9 @@
 using LoopToVecs
 using Test
+using Random
 
-@testset "LoopToVecs.jl" begin
-    # Write your tests here.
-end
+Random.seed!(0xDEADBEEF)
+include("test_helpers.jl")
+include("test_rewrite.jl")
+include("test_macro_broadcast.jl")
+include("test_macro_reduction.jl")
