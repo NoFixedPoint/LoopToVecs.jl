@@ -68,7 +68,7 @@ end
 
 b_ij = Reactant.to_rarray(b_ij)
 c_jk = Reactant.to_rarray(c_jk)
-f_compiled = f(b_ij, c_jk)
+f_compiled = @compile f(b_ij, c_jk)
 
 f_compiled(b_ij, c_jk)
 #=
