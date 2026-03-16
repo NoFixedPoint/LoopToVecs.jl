@@ -113,7 +113,9 @@ macro t(args...)
     ex = assn
     ex isa Expr || error("Expected an assignment expression after @t")
     is_addassign = (ex.head == :+=)
-    ex.head == :(=) || is_addassign || error("Use `=` or `+=` with @t")
+    is_inplace = (ex.head == :(=))
+    is_newvar = (ex.head == :(:=))
+    is_newvar || is_inplace || is_addassign || error("Use `:=`, `=`, or `+=` with @t")
 
     lhs = ex.args[1]
     rhs = ex.args[2]
@@ -164,7 +166,13 @@ macro t(args...)
         if is_scalar_lhs
             :( $L = $L + $rhs_final )
         else
-            :( $L = Base.broadcast(+, $L, $rhs_final) )
+            Expr(:(.=), L, :(Base.broadcast(+, $L, $rhs_final)))
+        end
+    elseif is_inplace
+        if is_scalar_lhs
+            :( $L = $rhs_final )
+        else
+            Expr(:(.=), L, rhs_final)
         end
     else
         :( $L = $rhs_final )
