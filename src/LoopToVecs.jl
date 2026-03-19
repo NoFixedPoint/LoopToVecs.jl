@@ -163,6 +163,61 @@ function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
 
     # permute + reshape on remaining loop dims
     remaining_syms = Symbol[s for (_, s) in remaining]
+
+    # --- diagonal detection: repeated symbols in remaining_syms ---
+    sym_counts = Dict{Symbol,Int}()
+    for s in remaining_syms
+        sym_counts[s] = get(sym_counts, s, 0) + 1
+    end
+    diag_in_ref = Symbol[s for (s, c) in sym_counts if c > 1]
+
+    if !isempty(diag_in_ref)
+        for dsym in diag_in_ref
+            # positions in remaining_syms that match this diagonal symbol
+            diag_pos = findall(s -> s == dsym, remaining_syms)
+            non_diag_pos = findall(s -> s != dsym, remaining_syms)
+
+            # permute to bring diagonal positions to front
+            perm_order = vcat(diag_pos, non_diag_pos)
+            need_diag_perm = perm_order != collect(1:length(remaining_syms))
+            if need_diag_perm
+                base = :(PermutedDimsArray($base, $(_tuple(perm_order))))
+            end
+
+            # CartesianIndex for diagonal extraction
+            first_orig = remaining[diag_pos[1]][1]  # original dim for range
+            range_expr = if haskey(shifted_ranges, dsym)
+                lo_expr, hi_expr = shifted_ranges[dsym]
+                :($lo_expr:$hi_expr)
+            else
+                :(axes($A, $first_orig))
+            end
+            n_rep = length(diag_pos)
+            ci_args = [range_expr for _ in 1:n_rep]
+            ci_expr = Expr(:., :CartesianIndex, Expr(:tuple, ci_args...))
+
+            n_colons = length(non_diag_pos)
+            if n_colons > 0
+                colon_args = [:(Colon()) for _ in 1:n_colons]
+                base = :($base[$ci_expr, $(colon_args...)])
+            else
+                base = :($base[$ci_expr])
+            end
+
+            # update remaining and remaining_syms: diagonal collapses to one
+            new_remaining = Tuple{Int,Symbol}[remaining[diag_pos[1]]]
+            for p in non_diag_pos
+                push!(new_remaining, remaining[p])
+            end
+            new_syms = Symbol[dsym]
+            for p in non_diag_pos
+                push!(new_syms, remaining_syms[p])
+            end
+            remaining_syms = new_syms
+            remaining = new_remaining
+        end
+    end
+
     unique_remaining = _unique_syms(remaining_syms)
 
     W = [idx for idx in canon if idx in unique_remaining]
@@ -387,6 +442,19 @@ macro t(args...)
         error("Cannot use `:=` with shifted indices on LHS")
     end
 
+    # detect diagonal: loop symbols appearing more than once on LHS
+    lhs_sym_counts = Dict{Symbol,Int}()
+    for s in Linds
+        lhs_sym_counts[s] = get(lhs_sym_counts, s, 0) + 1
+    end
+    diag_syms = Symbol[s for (s, c) in lhs_sym_counts if c > 1]
+    has_diagonal = !isempty(diag_syms)
+    Linds = _unique_syms(Linds)  # de-duplicate for canon
+
+    if has_diagonal && is_newvar
+        error("Cannot use `:=` with repeated indices on LHS (diagonal)")
+    end
+
     # RHS indices and reduction indices
     rhs_inds = _unique_syms(_collect_rhs_inds(rhs))
     red_inds = [s for s in rhs_inds if s ∉ Linds]
@@ -497,6 +565,54 @@ macro t(args...)
             end
         end
         lhs_target = :(view($L, $(lhs_view_args...)))
+    end
+
+    # handle diagonal LHS: repeated indices → CartesianIndex assignment
+    if has_diagonal && !is_scalar_lhs
+        # Start from current lhs_target (may already be a view from fixed handling)
+        if has_lhs_fixed
+            base_lhs = lhs_target
+        else
+            base_lhs = L
+        end
+
+        # Find non-fixed positions and their symbols
+        non_fixed_indices = Tuple{Int,Tuple}[]
+        for (d, idx) in enumerate(lhs.args[2:end])
+            pi = _parse_index(idx)
+            if pi[1] != :fixed
+                push!(non_fixed_indices, (d, pi))
+            end
+        end
+
+        # Get symbols of non-fixed positions
+        nf_syms = Symbol[nf[2][2]::Symbol for nf in non_fixed_indices]
+
+        dsym = diag_syms[1]
+        diag_pos = findall(i -> nf_syms[i] == dsym, 1:length(non_fixed_indices))
+        non_diag_pos = findall(i -> nf_syms[i] != dsym, 1:length(non_fixed_indices))
+
+        # Permute to bring diagonal positions to front
+        perm_order = vcat(diag_pos, non_diag_pos)
+        need_perm = perm_order != collect(1:length(non_fixed_indices))
+        if need_perm
+            base_lhs = :(PermutedDimsArray($base_lhs, $(_tuple(perm_order))))
+        end
+
+        # CartesianIndex
+        first_orig_dim = non_fixed_indices[diag_pos[1]][1]
+        range_expr = :(axes($L, $first_orig_dim))
+        n_rep = length(diag_pos)
+        ci_args = [range_expr for _ in 1:n_rep]
+        ci_expr = Expr(:., :CartesianIndex, Expr(:tuple, ci_args...))
+
+        n_colons = length(non_diag_pos)
+        if n_colons > 0
+            colon_args = [:(Colon()) for _ in 1:n_colons]
+            lhs_target = :($base_lhs[$ci_expr, $(colon_args...)])
+        else
+            lhs_target = :($base_lhs[$ci_expr])
+        end
     end
 
     # assignment
