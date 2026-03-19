@@ -112,16 +112,19 @@ Extend the `@t` macro to handle 6 additional patterns found in `code_samples/`, 
 @t resid_mu[n,n] = tau_bar_ni[n,n]
 ```
 
-**Semantics:** Operates on the "diagonal" — the subset of elements where repeated index positions are equal. Fully vectorized using `CartesianIndex`.
+**Semantics:** Operates on the "diagonal" — the subset of elements where repeated index positions are equal. Fully vectorized using `PermutedDimsArray` + `CartesianIndex`.
 
-**Restriction:** Repeated positions must be contiguous on the LHS (e.g., `A[n,n,j]` is valid; `A[n,j,n]` is an error). This is required for correct CartesianIndex indexing, since `A[ci, :]` places CartesianIndex in the leading dimensions.
+**Non-contiguous support:** Repeated positions need NOT be contiguous. When they are not (e.g., `A[n, j, n]`), a `PermutedDimsArray` permutation brings repeated positions to the front before applying `CartesianIndex`. Since `PermutedDimsArray` is a zero-cost view, modifications go through to the original array.
 
 **Implementation:**
 - Detect when a loop index appears more than once on the LHS
-- For a repeated index `n` appearing at k contiguous positions `[p1, p2, ..., pk]` on the LHS:
+- For a repeated index `n` appearing at k positions `[p1, p2, ..., pk]` (possibly non-contiguous) on the LHS:
+  - Compute a permutation that moves all repeated positions to the front, preserving order of non-repeated positions after them
+  - Apply `PermutedDimsArray(A, perm)` to get a view where repeated positions are contiguous and leading
   - Generate `ci = CartesianIndex.(range, range, ...)` with k entries
-  - On LHS: `A[ci, :, :]` where `:` fills non-repeated positions
-  - On RHS arrays with same pattern: `B[ci, :]` to extract diagonal values
+  - On LHS: `PermutedDimsArray(A, perm)[ci, :, :]` where `:` fills non-repeated positions
+  - On RHS arrays with same pattern: `PermutedDimsArray(B, perm)[ci, :]` to extract diagonal values
+  - If positions are already contiguous and leading, skip the permutation step
 - After extraction, the repeated positions collapse to a single dimension
 - The collapsed dimension participates in canonical order normally
 - Non-repeated dimensions use normal reshape+broadcast
@@ -174,9 +177,9 @@ Extensive tests for each feature, organized by feature:
 2. **Bare loop indices:** comparisons (`<`, `==`, `!=`, `>=`), arithmetic on indices, combined with array references, multi-index comparisons like `(n!=np)`
 3. **`*=` operator:** scalar, array, combined with other features; error when combined with reduction
 4. **Shifted indices:** `a+1`, `a-1`, multiple shifted refs, shifted on LHS (error), shifted on RHS with `:=`, range inference correctness, verify no sequential dependency issues
-5. **Diagonal indices:** 2-repeat, 3-repeat, mixed with non-repeated dims, mixed with fixed indices, on both LHS and RHS, non-contiguous error
+5. **Diagonal indices:** 2-repeat, 3-repeat, mixed with non-repeated dims, mixed with fixed indices, on both LHS and RHS, non-contiguous repeated positions (e.g., `A[n,j,n]`)
 6. **Integration tests:** Patterns directly from `code_samples/` (adapted with explicit `(+)` where needed)
-7. **Error tests:** `:=` with fixed/shifted/diagonal LHS errors, missing reduction op errors, `*=` with reduction error, non-contiguous diagonal error
+7. **Error tests:** `:=` with fixed/shifted/diagonal LHS errors, missing reduction op errors, `*=` with reduction error
 
 ## Code Sample Adaptation Note
 
