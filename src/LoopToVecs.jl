@@ -37,14 +37,21 @@ _tuple(xs) = Expr(:tuple, xs...)
 # should we convert this call to broadcast(f, ...)?
 const _NO_BCAST_FUNS = Set([:reshape, :dropdims, :sum, :maximum, :minimum, :prod,
                             :PermutedDimsArray, :tuple, :size, :axes, :length,
-                            :view, :CartesianIndex])
+                            :view, :CartesianIndex, :(:)])
 _should_broadcast(f) = (f isa Symbol) && !(f in _NO_BCAST_FUNS)
+
+# structural functions whose arguments should not be broadcastified
+const _STRUCTURAL_FUNS = Set([:reshape, :dropdims, :PermutedDimsArray, :view, :size, :axes, :length, :(:)])
 
 # turn calls & operators into Base.broadcast(f, args...)
 function _broadcastify(ex)
     ex isa Expr || return ex
     if ex.head == :call
         f, args = ex.args[1], ex.args[2:end]
+        if (f isa Symbol) && (f in _STRUCTURAL_FUNS)
+            # structural call: do not broadcastify or recurse into arguments
+            return ex
+        end
         args2 = map(_broadcastify, args)
         return _should_broadcast(f) ? :(
             Base.broadcast($f, $(args2...))
@@ -117,6 +124,9 @@ function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
 
     has_fixed = any(p[1] == :fixed for p in parsed)
     has_shifted = any(p[1] == :shifted for p in parsed)
+    # also check if any :loop index has a shifted range (from other refs using it shifted)
+    has_shifted_loop = any(p[1] == :loop && haskey(shifted_ranges, p[2]) for p in parsed)
+    needs_view = has_fixed || has_shifted || has_shifted_loop
 
     # build view args and track remaining (non-fixed) dims
     view_args = Any[]
@@ -134,13 +144,18 @@ function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
             end
             push!(remaining, (d, sym))
         else  # :loop
-            push!(view_args, :(:))
+            if haskey(shifted_ranges, p[2])
+                lo_expr, hi_expr = shifted_ranges[p[2]]
+                push!(view_args, :($lo_expr:$hi_expr))
+            else
+                push!(view_args, :(:))
+            end
             push!(remaining, (d, p[2]::Symbol))
         end
     end
 
     # build base expression
-    if has_fixed || has_shifted
+    if needs_view
         base = :(view($A, $(view_args...)))
     else
         base = A
@@ -168,7 +183,7 @@ function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
     shape = Any[]
     for s in canon
         if haskey(orig_dim_for_sym, s)
-            if has_shifted && haskey(shifted_ranges, s)
+            if haskey(shifted_ranges, s)
                 lo_expr, hi_expr = shifted_ranges[s]
                 push!(shape, :($hi_expr - $lo_expr + 1))
             else
@@ -264,6 +279,44 @@ function _replace_bare_indices(ex, loop_syms::Vector{Symbol}, canon::Vector{Symb
     end
 end
 
+# compute the valid range for a loop index that appears with shifts
+# constraints: Vector of (array_name, dim, offset)
+function _compute_shifted_range(constraints::Vector{Tuple{Symbol,Int,Int}})
+    lo_parts = Int[]
+    hi_parts = Any[]
+    for (A, d, k) in constraints
+        push!(lo_parts, max(1, 1 - k))
+        push!(hi_parts, k == 0 ? :(size($A, $d)) : :(size($A, $d) - $k))
+    end
+    lo = maximum(lo_parts)
+    hi = length(hi_parts) == 1 ? hi_parts[1] : Expr(:call, :min, hi_parts...)
+    return (lo, hi)
+end
+
+# gather all shift constraints from an expression (LHS or RHS)
+function _collect_shifted_constraints(ex, acc::Dict{Symbol,Vector{Tuple{Symbol,Int,Int}}})
+    ex isa Expr || return acc
+    if ex.head == :ref && ex.args[1] isa Symbol
+        A = ex.args[1]::Symbol
+        for (d, idx) in enumerate(ex.args[2:end])
+            pi = _parse_index(idx)
+            if pi[1] == :loop
+                sym = pi[2]::Symbol
+                constraints = get!(acc, sym, Tuple{Symbol,Int,Int}[])
+                push!(constraints, (A, d, 0))
+            elseif pi[1] == :shifted
+                sym, offset = pi[2]::Symbol, pi[3]::Int
+                constraints = get!(acc, sym, Tuple{Symbol,Int,Int}[])
+                push!(constraints, (A, d, offset))
+            end
+        end
+    end
+    for a in ex.args
+        _collect_shifted_constraints(a, acc)
+    end
+    acc
+end
+
 # map (+,* ,max,min) -> (sum,prod,maximum,minimum)
 const _REDMAP = Dict{Symbol,Symbol}(:+ => :sum, :* => :prod, :max => :maximum, :min => :minimum)
 
@@ -304,6 +357,7 @@ macro t(args...)
     Linds = Symbol[]
     lhs_fixed = Tuple{Int,Any}[]
     has_lhs_fixed = false
+    has_lhs_shifted = false
 
     if is_scalar_lhs
         L = lhs::Symbol
@@ -318,14 +372,19 @@ macro t(args...)
             elseif pi[1] == :fixed
                 push!(lhs_fixed, (d, pi[2]))
                 has_lhs_fixed = true
-            else
-                error("Shifted indices on LHS are not yet supported")
+            elseif pi[1] == :shifted
+                push!(Linds, pi[2]::Symbol)
+                has_lhs_shifted = true
             end
         end
     end
 
     if has_lhs_fixed && is_newvar
         error("Cannot use `:=` with fixed indices on LHS (use `=` or `+=`)")
+    end
+
+    if has_lhs_shifted && is_newvar
+        error("Cannot use `:=` with shifted indices on LHS")
     end
 
     # RHS indices and reduction indices
@@ -342,12 +401,41 @@ macro t(args...)
     # collect index sources for bare index replacement
     index_sources = _collect_index_sources(lhs, rhs, Linds)
 
+    # collect shift constraints from both LHS and RHS
+    all_constraints = Dict{Symbol,Vector{Tuple{Symbol,Int,Int}}}()
+    # from LHS (skip for := since the LHS array doesn't exist yet)
+    if !is_scalar_lhs && !is_newvar
+        for (d, idx) in enumerate(lhs.args[2:end])
+            pi = _parse_index(idx)
+            if pi[1] == :loop
+                cs = get!(all_constraints, pi[2]::Symbol, Tuple{Symbol,Int,Int}[])
+                push!(cs, (L, d, 0))
+            elseif pi[1] == :shifted
+                cs = get!(all_constraints, pi[2]::Symbol, Tuple{Symbol,Int,Int}[])
+                push!(cs, (L, d, pi[3]::Int))
+            end
+        end
+    end
+    # from RHS
+    _collect_shifted_constraints(rhs, all_constraints)
+
+    # identify which indices have actual shifts
+    shifted_syms = Symbol[sym for (sym, cs) in all_constraints
+                          if any(c[3] != 0 for c in cs)]
+
+    # compute shifted ranges
+    shifted_ranges = Dict{Symbol,Tuple}()
+    for sym in shifted_syms
+        shifted_ranges[sym] = _compute_shifted_range(all_constraints[sym])
+    end
+
     # replace bare loop indices BEFORE rewriting refs
     loop_syms_set = vcat(Linds, red_inds)
-    rhs_bare = _replace_bare_indices(rhs, loop_syms_set, canon, index_sources)
+    rhs_bare = _replace_bare_indices(rhs, loop_syms_set, canon, index_sources;
+                                      shifted_ranges=shifted_ranges)
 
     # rewrite RHS array refs (on rhs_bare instead of rhs)
-    rhs_rw = _rewrite_rhs(rhs_bare, canon)
+    rhs_rw = _rewrite_rhs(rhs_bare, canon; shifted_ranges=shifted_ranges)
     rhs_b  = _broadcastify(rhs_rw)
 
     # build the RHS (reduction or not)
@@ -364,7 +452,19 @@ macro t(args...)
         end
     end
 
-    # build LHS target (view for fixed LHS positions)
+    # check if any LHS loop index has a shifted range (from RHS shifts)
+    has_lhs_shifted_range = false
+    if !is_scalar_lhs && !has_lhs_shifted && !has_lhs_fixed
+        for (d, idx) in enumerate(lhs.args[2:end])
+            pi = _parse_index(idx)
+            if pi[1] == :loop && haskey(shifted_ranges, pi[2])
+                has_lhs_shifted_range = true
+                break
+            end
+        end
+    end
+
+    # build LHS target (view for fixed, shifted, or shifted-range LHS positions)
     lhs_target = L
     if has_lhs_fixed && !is_scalar_lhs
         lhs_view_args = Any[]
@@ -374,6 +474,26 @@ macro t(args...)
                 push!(lhs_view_args, pi[2])
             else
                 push!(lhs_view_args, :(:))
+            end
+        end
+        lhs_target = :(view($L, $(lhs_view_args...)))
+    elseif (has_lhs_shifted || has_lhs_shifted_range) && !is_scalar_lhs && !is_newvar
+        lhs_view_args = Any[]
+        for (d, idx) in enumerate(lhs.args[2:end])
+            pi = _parse_index(idx)
+            if pi[1] == :fixed
+                push!(lhs_view_args, pi[2])
+            elseif pi[1] == :shifted
+                sym, offset = pi[2]::Symbol, pi[3]::Int
+                lo_expr, hi_expr = shifted_ranges[sym]
+                push!(lhs_view_args, :(($lo_expr + $offset):($hi_expr + $offset)))
+            else  # :loop
+                if haskey(shifted_ranges, pi[2])
+                    lo_expr, hi_expr = shifted_ranges[pi[2]]
+                    push!(lhs_view_args, :($lo_expr:$hi_expr))
+                else
+                    push!(lhs_view_args, :(:))
+                end
             end
         end
         lhs_target = :(view($L, $(lhs_view_args...)))
