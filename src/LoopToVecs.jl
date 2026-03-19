@@ -36,12 +36,12 @@ _tuple(xs) = Expr(:tuple, xs...)
 
 # should we convert this call to broadcast(f, ...)?
 const _NO_BCAST_FUNS = Set([:reshape, :dropdims, :sum, :maximum, :minimum, :prod,
-                            :PermutedDimsArray, :tuple, :size, :axes, :length,
+                            :PermutedDimsArray, :permutedims, :tuple, :size, :axes, :length,
                             :view, :CartesianIndex, :(:)])
 _should_broadcast(f) = (f isa Symbol) && !(f in _NO_BCAST_FUNS)
 
 # structural functions whose arguments should not be broadcastified
-const _STRUCTURAL_FUNS = Set([:reshape, :dropdims, :PermutedDimsArray, :view, :size, :axes, :length, :(:)])
+const _STRUCTURAL_FUNS = Set([:reshape, :dropdims, :PermutedDimsArray, :permutedims, :view, :size, :axes, :length, :(:)])
 
 # turn calls & operators into Base.broadcast(f, args...)
 function _broadcastify(ex)
@@ -113,7 +113,7 @@ function _rewrite_ref(A::Symbol, IA::Vector{Symbol}, canon::Vector{Symbol})
     shape = Any[ haskey(pos_in_A, s) ? :(size($A, $(pos_in_A[s]))) : 1 for s in canon ]
     shape_expr = _tuple(shape)
 
-    base = needperm ? :(PermutedDimsArray($A, $perm_expr)) : A
+    base = needperm ? :(permutedims($A, $perm_expr)) : A
     :( reshape($base, $shape_expr) )
 end
 
@@ -181,7 +181,7 @@ function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
             perm_order = vcat(diag_pos, non_diag_pos)
             need_diag_perm = perm_order != collect(1:length(remaining_syms))
             if need_diag_perm
-                base = :(PermutedDimsArray($base, $(_tuple(perm_order))))
+                base = :(permutedims($base, $(_tuple(perm_order))))
             end
 
             # CartesianIndex for diagonal extraction
@@ -226,7 +226,7 @@ function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
     perm_expr = _tuple(perm)
 
     if needperm
-        base = :(PermutedDimsArray($base, $perm_expr))
+        base = :(permutedims($base, $perm_expr))
     end
 
     # shape: for each canon index, use size from original array or 1
