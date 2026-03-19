@@ -1,6 +1,7 @@
 using LoopToVecs
 using Test
 using Random
+using LinearAlgebra
 
 Random.seed!(0xDEADBEEF)
 include("test_helpers.jl")
@@ -13,3 +14,4 @@ include("test_fixed_indices.jl")
 include("test_bare_indices.jl")
 include("test_shifted_indices.jl")
 include("test_diagonal_indices.jl")
+include("test_integration.jl")
