@@ -32,7 +32,8 @@ _tuple(xs) = Expr(:tuple, xs...)
 
 # should we convert this call to broadcast(f, ...)?
 const _NO_BCAST_FUNS = Set([:reshape, :dropdims, :sum, :maximum, :minimum, :prod,
-                            :PermutedDimsArray, :tuple, :size, :axes, :length])
+                            :PermutedDimsArray, :tuple, :size, :axes, :length,
+                            :view, :CartesianIndex])
 _should_broadcast(f) = (f isa Symbol) && !(f in _NO_BCAST_FUNS)
 
 # turn calls & operators into Base.broadcast(f, args...)
@@ -49,6 +50,41 @@ function _broadcastify(ex)
     else
         return Expr(ex.head, map(_broadcastify, ex.args)...)
     end
+end
+
+# parse a single index expression from an array subscript
+# Returns (type::Symbol, value, offset::Int)
+#   (:loop, sym, 0)       — plain loop index
+#   (:fixed, expr, 0)     — fixed scalar ($expr or integer literal)
+#   (:shifted, sym, k)    — shifted loop index sym+k
+function _parse_index(ex)
+    if ex isa Integer
+        return (:fixed, ex, 0)
+    elseif ex isa Symbol
+        return (:loop, ex, 0)
+    elseif !(ex isa Expr)
+        error("Unsupported index expression: $ex")
+    end
+    if ex.head == :$
+        return (:fixed, ex.args[1], 0)
+    elseif ex.head == :call && length(ex.args) == 3
+        op, arg1, arg2 = ex.args
+        if (op === :+ || op === :-) && arg2 isa Integer
+            if arg1 isa Expr && arg1.head == :$
+                # ($sym) + k → fixed with runtime arithmetic
+                return (:fixed, Expr(:call, op, arg1.args[1], arg2), 0)
+            elseif arg1 isa Symbol
+                # sym + k → shifted loop index
+                offset = (op === :+) ? arg2 : -arg2
+                return (:shifted, arg1, offset)
+            end
+        end
+        # k + sym → shifted (Julia may parse 1+a as +(1, a))
+        if op === :+ && arg1 isa Integer && arg2 isa Symbol
+            return (:shifted, arg2, arg1)
+        end
+    end
+    error("Unsupported index expression: $ex")
 end
 
 # rewrite a single A[i,j,...] into reshape(permuted(A), fullshape)
@@ -113,9 +149,11 @@ macro t(args...)
     ex = assn
     ex isa Expr || error("Expected an assignment expression after @t")
     is_addassign = (ex.head == :+=)
+    is_mulassign = (ex.head == :*=)
     is_inplace = (ex.head == :(=))
     is_newvar = (ex.head == :(:=))
-    is_newvar || is_inplace || is_addassign || error("Use `:=`, `=`, or `+=` with @t")
+    is_newvar || is_inplace || is_addassign || is_mulassign ||
+        error("Use `:=`, `=`, `+=`, or `*=` with @t")
 
     lhs = ex.args[1]
     rhs = ex.args[2]
@@ -141,6 +179,9 @@ macro t(args...)
     if !isempty(red_inds) && redsym === nothing
         error("Found reduction indices $(red_inds) but no reduction op was given (e.g. @t (+) ...)")
     end
+    if is_mulassign && redsym !== nothing
+        error("Cannot combine `*=` with a reduction operator")
+    end
     canon = vcat(Linds, red_inds)
 
     # rewrite RHS into canonical order, then broadcastify
@@ -162,7 +203,13 @@ macro t(args...)
     end
 
     # assignment
-    out = if is_addassign
+    out = if is_mulassign
+        if is_scalar_lhs
+            :( $L = $L * $rhs_final )
+        else
+            Expr(:(.=), L, :(Base.broadcast(*, $L, $rhs_final)))
+        end
+    elseif is_addassign
         if is_scalar_lhs
             :( $L = $L + $rhs_final )
         else
