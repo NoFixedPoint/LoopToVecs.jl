@@ -18,7 +18,11 @@ function _collect_rhs_inds(ex, acc::Vector{Symbol}=Symbol[])
     ex isa Expr || return acc
     if ex.head == :ref && ex.args[1] isa Symbol
         for a in ex.args[2:end]
-            a isa Symbol && (a ∉ acc) && push!(acc, a)
+            pi = _parse_index(a)
+            if pi[1] == :loop || pi[1] == :shifted
+                sym = pi[2]::Symbol
+                (sym ∉ acc) && push!(acc, sym)
+            end
         end
     end
     for a in ex.args
@@ -88,6 +92,7 @@ function _parse_index(ex)
 end
 
 # rewrite a single A[i,j,...] into reshape(permuted(A), fullshape)
+# (kept for backward compatibility with existing unit tests)
 function _rewrite_ref(A::Symbol, IA::Vector{Symbol}, canon::Vector{Symbol})
     # W = indices of this array in canonical order
     W = [idx for idx in canon if idx in IA]
@@ -105,22 +110,96 @@ function _rewrite_ref(A::Symbol, IA::Vector{Symbol}, canon::Vector{Symbol})
     :( reshape($base, $shape_expr) )
 end
 
+# extended rewrite: handles fixed ($expr/integer) indices via view()
+function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
+                          shifted_ranges::Dict{Symbol,Tuple}=Dict{Symbol,Tuple}())
+    parsed = [_parse_index(idx) for idx in raw_indices]
+
+    has_fixed = any(p[1] == :fixed for p in parsed)
+    has_shifted = any(p[1] == :shifted for p in parsed)
+
+    # build view args and track remaining (non-fixed) dims
+    view_args = Any[]
+    remaining = Tuple{Int,Symbol}[]  # (orig_dim, loop_symbol)
+    for (d, p) in enumerate(parsed)
+        if p[1] == :fixed
+            push!(view_args, p[2])
+        elseif p[1] == :shifted
+            sym, offset = p[2]::Symbol, p[3]::Int
+            if haskey(shifted_ranges, sym)
+                lo_expr, hi_expr = shifted_ranges[sym]
+                push!(view_args, :(($lo_expr + $offset):($hi_expr + $offset)))
+            else
+                push!(view_args, :(:))
+            end
+            push!(remaining, (d, sym))
+        else  # :loop
+            push!(view_args, :(:))
+            push!(remaining, (d, p[2]::Symbol))
+        end
+    end
+
+    # build base expression
+    if has_fixed || has_shifted
+        base = :(view($A, $(view_args...)))
+    else
+        base = A
+    end
+
+    # permute + reshape on remaining loop dims
+    remaining_syms = Symbol[s for (_, s) in remaining]
+    unique_remaining = _unique_syms(remaining_syms)
+
+    W = [idx for idx in canon if idx in unique_remaining]
+    perm = [findfirst(==(unique_remaining[d]), W) for d in 1:length(unique_remaining)]
+    needperm = any(p != d for (p, d) in zip(perm, 1:length(unique_remaining)))
+    perm_expr = _tuple(perm)
+
+    if needperm
+        base = :(PermutedDimsArray($base, $perm_expr))
+    end
+
+    # shape: for each canon index, use size from original array or 1
+    orig_dim_for_sym = Dict{Symbol,Int}()
+    for (d, s) in remaining
+        haskey(orig_dim_for_sym, s) || (orig_dim_for_sym[s] = d)
+    end
+
+    shape = Any[]
+    for s in canon
+        if haskey(orig_dim_for_sym, s)
+            if has_shifted && haskey(shifted_ranges, s)
+                lo_expr, hi_expr = shifted_ranges[s]
+                push!(shape, :($hi_expr - $lo_expr + 1))
+            else
+                push!(shape, :(size($A, $(orig_dim_for_sym[s]))))
+            end
+        else
+            push!(shape, 1)
+        end
+    end
+    shape_expr = _tuple(shape)
+
+    :(reshape($base, $shape_expr))
+end
+
 # rewrite all array refs on RHS using the canonical order
-function _rewrite_rhs(ex, canon::Vector{Symbol})
+function _rewrite_rhs(ex, canon::Vector{Symbol};
+                      shifted_ranges::Dict{Symbol,Tuple}=Dict{Symbol,Tuple}())
     if !(ex isa Expr)
         return ex
     elseif ex.head == :ref && ex.args[1] isa Symbol
         A = ex.args[1]::Symbol
-        IA = Symbol[ s for s in ex.args[2:end] if s isa Symbol ]
-        return _rewrite_ref(A, IA, canon)
+        raw_indices = ex.args[2:end]
+        return _rewrite_ref_ext(A, raw_indices, canon; shifted_ranges=shifted_ranges)
     elseif ex.head == :call
-        # recurse, then broadcastify (leaving protected calls intact)
         f, args = ex.args[1], ex.args[2:end]
-        args2 = map(a -> _rewrite_rhs(a, canon), args)
+        args2 = map(a -> _rewrite_rhs(a, canon; shifted_ranges=shifted_ranges), args)
         ex2 = Expr(:call, f, args2...)
         return _broadcastify(ex2)
     else
-        return Expr(ex.head, map(a -> _rewrite_rhs(a, canon), ex.args)...)
+        return Expr(ex.head,
+            map(a -> _rewrite_rhs(a, canon; shifted_ranges=shifted_ranges), ex.args)...)
     end
 end
 
@@ -158,19 +237,34 @@ macro t(args...)
     lhs = ex.args[1]
     rhs = ex.args[2]
 
-    # LHS: either scalar symbol, or array ref with plain-symbol indices
+    # LHS: scalar symbol, or array ref with loop/fixed indices
     is_scalar_lhs = lhs isa Symbol
     local L::Symbol
     Linds = Symbol[]
+    lhs_fixed = Tuple{Int,Any}[]
+    has_lhs_fixed = false
+
     if is_scalar_lhs
         L = lhs::Symbol
     else
         (lhs isa Expr && lhs.head == :ref && lhs.args[1] isa Symbol) ||
             error("LHS must be a variable (scalar) or an array reference like A[i,j,...]")
-        any(!(lhs.args[i] isa Symbol) for i in 2:length(lhs.args)) &&
-            error("LHS indices must be plain symbols, like A[i,j,...]")
         L = lhs.args[1]::Symbol
-        Linds = Symbol[lhs.args[i] for i in 2:length(lhs.args)]
+        for (d, idx) in enumerate(lhs.args[2:end])
+            pi = _parse_index(idx)
+            if pi[1] == :loop
+                push!(Linds, pi[2]::Symbol)
+            elseif pi[1] == :fixed
+                push!(lhs_fixed, (d, pi[2]))
+                has_lhs_fixed = true
+            else
+                error("Shifted indices on LHS are not yet supported")
+            end
+        end
+    end
+
+    if has_lhs_fixed && is_newvar
+        error("Cannot use `:=` with fixed indices on LHS (use `=` or `+=`)")
     end
 
     # RHS indices and reduction indices
@@ -202,24 +296,39 @@ macro t(args...)
         end
     end
 
+    # build LHS target (view for fixed LHS positions)
+    lhs_target = L
+    if has_lhs_fixed && !is_scalar_lhs
+        lhs_view_args = Any[]
+        for (d, idx) in enumerate(lhs.args[2:end])
+            pi = _parse_index(idx)
+            if pi[1] == :fixed
+                push!(lhs_view_args, pi[2])
+            else
+                push!(lhs_view_args, :(:))
+            end
+        end
+        lhs_target = :(view($L, $(lhs_view_args...)))
+    end
+
     # assignment
     out = if is_mulassign
         if is_scalar_lhs
             :( $L = $L * $rhs_final )
         else
-            Expr(:(.=), L, :(Base.broadcast(*, $L, $rhs_final)))
+            Expr(:(.=), lhs_target, :(Base.broadcast(*, $lhs_target, $rhs_final)))
         end
     elseif is_addassign
         if is_scalar_lhs
             :( $L = $L + $rhs_final )
         else
-            Expr(:(.=), L, :(Base.broadcast(+, $L, $rhs_final)))
+            Expr(:(.=), lhs_target, :(Base.broadcast(+, $lhs_target, $rhs_final)))
         end
     elseif is_inplace
         if is_scalar_lhs
             :( $L = $rhs_final )
         else
-            Expr(:(.=), L, rhs_final)
+            Expr(:(.=), lhs_target, rhs_final)
         end
     else
         :( $L = $rhs_final )
