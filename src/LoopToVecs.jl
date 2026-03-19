@@ -203,6 +203,67 @@ function _rewrite_rhs(ex, canon::Vector{Symbol};
     end
 end
 
+# collect index sources: maps each loop index symbol to (array, dim) for range lookup
+function _collect_index_sources(lhs, rhs, Linds::Vector{Symbol})
+    sources = Dict{Symbol,Tuple{Symbol,Int}}()
+    # from LHS first
+    if lhs isa Expr && lhs.head == :ref && lhs.args[1] isa Symbol
+        arr = lhs.args[1]::Symbol
+        for (d, idx) in enumerate(lhs.args[2:end])
+            pi = _parse_index(idx)
+            if (pi[1] == :loop || pi[1] == :shifted) && !haskey(sources, pi[2]::Symbol)
+                sources[pi[2]::Symbol] = (arr, d)
+            end
+        end
+    end
+    _collect_index_sources_rhs!(sources, rhs)
+    return sources
+end
+
+function _collect_index_sources_rhs!(sources::Dict{Symbol,Tuple{Symbol,Int}}, ex)
+    ex isa Expr || return
+    if ex.head == :ref && ex.args[1] isa Symbol
+        arr = ex.args[1]::Symbol
+        for (d, idx) in enumerate(ex.args[2:end])
+            pi = _parse_index(idx)
+            if (pi[1] == :loop || pi[1] == :shifted) && !haskey(sources, pi[2]::Symbol)
+                sources[pi[2]::Symbol] = (arr, d)
+            end
+        end
+    end
+    for a in ex.args
+        _collect_index_sources_rhs!(sources, a)
+    end
+end
+
+# replace bare loop index symbols (outside :ref nodes) with reshaped range vectors
+function _replace_bare_indices(ex, loop_syms::Vector{Symbol}, canon::Vector{Symbol},
+                               sources::Dict{Symbol,Tuple{Symbol,Int}};
+                               shifted_ranges::Dict{Symbol,Tuple}=Dict{Symbol,Tuple}())
+    if ex isa Expr && ex.head == :ref
+        # :ref node — do NOT replace symbols in subscript positions
+        return ex
+    elseif ex isa Symbol && ex in loop_syms && (haskey(sources, ex) || haskey(shifted_ranges, ex))
+        # bare loop index — replace with reshaped range vector
+        if haskey(shifted_ranges, ex)
+            lo_expr, hi_expr = shifted_ranges[ex]
+            range_expr = :($lo_expr:$hi_expr)
+        else
+            arr, dim = sources[ex]
+            range_expr = :(axes($arr, $dim))
+        end
+        canon_pos = findfirst(==(ex), canon)
+        shape = Any[i == canon_pos ? :(:) : 1 for i in 1:length(canon)]
+        return :(reshape($range_expr, $(Expr(:tuple, shape...))))
+    elseif ex isa Expr
+        new_args = Any[_replace_bare_indices(a, loop_syms, canon, sources;
+                       shifted_ranges=shifted_ranges) for a in ex.args]
+        return Expr(ex.head, new_args...)
+    else
+        return ex
+    end
+end
+
 # map (+,* ,max,min) -> (sum,prod,maximum,minimum)
 const _REDMAP = Dict{Symbol,Symbol}(:+ => :sum, :* => :prod, :max => :maximum, :min => :minimum)
 
@@ -278,8 +339,15 @@ macro t(args...)
     end
     canon = vcat(Linds, red_inds)
 
-    # rewrite RHS into canonical order, then broadcastify
-    rhs_rw = _rewrite_rhs(rhs, canon)
+    # collect index sources for bare index replacement
+    index_sources = _collect_index_sources(lhs, rhs, Linds)
+
+    # replace bare loop indices BEFORE rewriting refs
+    loop_syms_set = vcat(Linds, red_inds)
+    rhs_bare = _replace_bare_indices(rhs, loop_syms_set, canon, index_sources)
+
+    # rewrite RHS array refs (on rhs_bare instead of rhs)
+    rhs_rw = _rewrite_rhs(rhs_bare, canon)
     rhs_b  = _broadcastify(rhs_rw)
 
     # build the RHS (reduction or not)
