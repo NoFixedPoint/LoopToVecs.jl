@@ -75,6 +75,29 @@ end
     @test result ≈ vec(sum(A[2, :, :], dims=1))
 end
 
+@testset "Fixed indices: all-fixed 1D array ref as scalar on RHS" begin
+    # 1D array with single $var index should produce a scalar, not a reshaped view
+    zeta = [10.0, 20.0, 30.0]
+    B = rand(4)
+    idx = 2
+    @t result[j] := zeta[$idx] * B[j]
+    @test result ≈ 20.0 .* B
+
+    # multiple all-fixed 1D refs in one expression
+    alpha = [1.0, 2.0, 3.0]
+    beta_arr = [4.0, 5.0, 6.0]
+    C = rand(5)
+    a = 1; b = 3
+    @t out[x] := alpha[$a] * C[x] + beta_arr[$b]
+    @test out ≈ 1.0 .* C .+ 6.0
+
+    # integer-literal all-fixed 1D ref
+    zeta2 = [10.0, 20.0, 30.0]
+    D = rand(4)
+    @t res2[j] := zeta2[2] * D[j]
+    @test res2 ≈ 20.0 .* D
+end
+
 @testset "Fixed indices: errors" begin
     # integer literal fixed index with := should error at macro expansion
     @test_throws LoadError begin
