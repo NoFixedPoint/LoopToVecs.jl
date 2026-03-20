@@ -169,6 +169,11 @@ function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
     # permute + reshape on remaining loop dims
     remaining_syms = Symbol[s for (_, s) in remaining]
 
+    # all indices were fixed → base is already a scalar, no reshape needed
+    if isempty(remaining)
+        return base
+    end
+
     # --- diagonal detection: repeated symbols in remaining_syms ---
     sym_counts = Dict{Symbol,Int}()
     for s in remaining_syms
