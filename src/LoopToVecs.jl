@@ -169,9 +169,10 @@ function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
     # permute + reshape on remaining loop dims
     remaining_syms = Symbol[s for (_, s) in remaining]
 
-    # all indices were fixed → base is already a scalar, no reshape needed
+    # all indices were fixed → use getindex for a true scalar (not view)
     if isempty(remaining)
-        return base
+        fixed_args = Any[p[2] for p in parsed]
+        return :($A[$(fixed_args...)])
     end
 
     # --- diagonal detection: repeated symbols in remaining_syms ---
