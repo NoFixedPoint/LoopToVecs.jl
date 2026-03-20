@@ -145,6 +145,38 @@ end
     end
 end
 
+@testset "Integration: 3+ dim permutation with different sizes" begin
+    # Regression test: permutation must be correct when 3+ dimensions
+    # have different sizes (not just transpositions).
+    # Uses different sizes to catch perm vs invperm confusion.
+    num_a, num_n, num_j = 2, 3, 4
+
+    A = rand(num_a, num_n, num_j)
+
+    # Reduction over a: B[n,j] = sum_a A[a,n,j]
+    @t (+) B[n, j] := A[a, n, j]
+    for n in 1:num_n, j in 1:num_j
+        @test B[n, j] ≈ sum(A[:, n, j])
+    end
+
+    # Pure permutation (no reduction): C[n,j,a] = A[a,n,j]
+    @t C[n, j, a] := A[a, n, j]
+    for a in 1:num_a, n in 1:num_n, j in 1:num_j
+        @test C[n, j, a] ≈ A[a, n, j]
+    end
+
+    # 4D pattern matching solve_eq.jl: e_aj[a,j]*N_a_njs[a,n,j,s]
+    num_s = 2
+    N_a_njs = rand(num_a, num_n, num_j, num_s)
+    e_aj = rand(num_a, num_j)
+    @t (+) W_denom[n, j] := e_aj[a, j] * N_a_njs[a, n, j, s]
+    for n in 1:num_n, j in 1:num_j
+        expected = sum(e_aj[a, j] * N_a_njs[a, n, j, s]
+                       for a in 1:num_a, s in 1:num_s)
+        @test W_denom[n, j] ≈ expected
+    end
+end
+
 @testset "Integration: \$a inside for loop (solve_aggregates adaptation)" begin
     # Patterns from code_samples that use Tullio's implicit reduction
     # must be adapted with explicit (+) for LoopToVecs.

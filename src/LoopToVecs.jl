@@ -109,7 +109,7 @@ function _rewrite_ref(A::Symbol, IA::Vector{Symbol}, canon::Vector{Symbol})
     # W = indices of this array in canonical order
     W = [idx for idx in canon if idx in IA]
     # permutation mapping old positions -> new positions following canon
-    perm = [findfirst(==(IA[d]), W) for d in 1:length(IA)]
+    perm = [findfirst(==(W[d]), IA) for d in 1:length(IA)]
     needperm = any(p != d for (p,d) in zip(perm, 1:length(IA)))
     perm_expr = _tuple(perm)
 
@@ -232,7 +232,7 @@ function _rewrite_ref_ext(A::Symbol, raw_indices, canon::Vector{Symbol};
     unique_remaining = _unique_syms(remaining_syms)
 
     W = [idx for idx in canon if idx in unique_remaining]
-    perm = [findfirst(==(unique_remaining[d]), W) for d in 1:length(unique_remaining)]
+    perm = [findfirst(==(W[d]), unique_remaining) for d in 1:length(unique_remaining)]
     needperm = any(p != d for (p, d) in zip(perm, 1:length(unique_remaining)))
     perm_expr = _tuple(perm)
 
